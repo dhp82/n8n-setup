@@ -854,29 +854,26 @@ create_docker_compose() {
     local N8N_ENCRYPTION_KEY
     N8N_ENCRYPTION_KEY=$(generate_encryption_key)
     
-    # Generate htpasswd for Traefik
-    local TRAEFIK_HTPASSWD
-    TRAEFIK_HTPASSWD=$(generate_htpasswd "${TRAEFIK_USER:-admin}" "${TRAEFIK_PASSWORD:-admin123}")
-    # Escape $ for docker-compose
-    TRAEFIK_HTPASSWD=$(echo "$TRAEFIK_HTPASSWD" | sed 's/\$/\$\$/g')
+    # Escape special characters in passwords for YAML
+    local MYSQL_ROOT_PASS_SAFE=$(printf '%s' "${MYSQL_ROOT_PASSWORD:-rootpassword123}" | sed "s/'/'\\\\''/g")
+    local MYSQL_PASS_SAFE=$(printf '%s' "${MYSQL_PASSWORD:-password}" | sed "s/'/'\\\\''/g")
+    local MYSQL_USER_SAFE="${MYSQL_USER:-dbuser}"
     
-    # Update middlewares with actual htpasswd
-    sed -i "s|\${TRAEFIK_HTPASSWD:-admin:\\\$apr1\\\$default}|$TRAEFIK_HTPASSWD|g" "$TRAEFIK_DYNAMIC_DIR/middlewares.yml"
-    
-    # Determine domain settings
     local BASE_DOMAIN="${CF_HOSTNAME:-localhost}"
+    
+    # Xác định hosts
     local N8N_HOST="n8n.${BASE_DOMAIN}"
     local PMA_HOST="pma.${BASE_DOMAIN}"
     local TRAEFIK_HOST="traefik.${BASE_DOMAIN}"
     
     if [ "$BASE_DOMAIN" = "localhost" ]; then
-        # Local mode - use .localhost domains
         N8N_HOST="n8n.localhost"
         PMA_HOST="pma.localhost"
         TRAEFIK_HOST="traefik.localhost"
     fi
 
-    cat > "$MAIN_COMPOSE_FILE" << EOF
+    # QUAN TRỌNG: Dùng 'ENDOFFILE' có quote để tránh expansion
+    cat > "$MAIN_COMPOSE_FILE" << 'ENDOFFILE'
 networks:
   traefik-network:
     name: traefik-network
@@ -885,14 +882,7 @@ networks:
     name: internal-network
     driver: bridge
 
-volumes:
-  mysql_data:
-    driver: local
-
 services:
-  # ============================================
-  # TRAEFIK - Reverse Proxy
-  # ============================================
   traefik:
     image: traefik:v3.2
     container_name: traefik
@@ -902,69 +892,62 @@ services:
     ports:
       - "80:80"
       - "443:443"
-EOF
-
-    # Add Traefik dashboard port for local mode
-    if [ "$BASE_DOMAIN" = "localhost" ]; then
-        cat >> "$MAIN_COMPOSE_FILE" << EOF
       - "8080:8080"
-EOF
-    fi
-
-    cat >> "$MAIN_COMPOSE_FILE" << EOF
-    environment:
-      - TZ=${SYSTEM_TZ}
+    command:
+      - "--api.dashboard=true"
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=traefik-network"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--log.level=INFO"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ${TRAEFIK_CONFIG_FILE}:/etc/traefik/traefik.yml:ro
-      - ${TRAEFIK_DYNAMIC_DIR}:/etc/traefik/dynamic:ro
-      - ${TRAEFIK_DIR}/acme:/etc/traefik/acme
     networks:
       - traefik-network
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.traefik.rule=Host(\`${TRAEFIK_HOST}\`)"
-EOF
-
-    if [ "$BASE_DOMAIN" != "localhost" ]; then
-        cat >> "$MAIN_COMPOSE_FILE" << EOF
-      - "traefik.http.routers.traefik.entrypoints=websecure"
-      - "traefik.http.routers.traefik.tls=true"
-      - "traefik.http.routers.traefik.tls.certresolver=letsencrypt"
-EOF
-    else
-        cat >> "$MAIN_COMPOSE_FILE" << EOF
+      - "traefik.http.routers.traefik.rule=Host(`TRAEFIK_HOST_PLACEHOLDER`)"
       - "traefik.http.routers.traefik.entrypoints=web"
-EOF
-    fi
-
-    cat >> "$MAIN_COMPOSE_FILE" << EOF
       - "traefik.http.routers.traefik.service=api@internal"
-      - "traefik.http.routers.traefik.middlewares=auth@file"
 
-  # ============================================
-  # N8N - Workflow Automation
-  # ============================================
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    restart: unless-stopped
+    environment:
+      - MYSQL_ROOT_PASSWORD=MYSQL_ROOT_PASS_PLACEHOLDER
+      - MYSQL_USER=MYSQL_USER_PLACEHOLDER
+      - MYSQL_PASSWORD=MYSQL_PASS_PLACEHOLDER
+      - MYSQL_DATABASE=n8n
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - internal
+    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
   n8n:
     image: n8nio/n8n:latest
     container_name: n8n
     restart: unless-stopped
     environment:
-      - TZ=${SYSTEM_TZ}
-      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
-      - N8N_HOST=${N8N_HOST}
-      - WEBHOOK_URL=https://${N8N_HOST}/
-      - N8N_METRICS=false
-      - N8N_DIAGNOSTICS_ENABLED=false
-      - N8N_VERSION_NOTIFICATIONS_ENABLED=false
+      - TZ=TIMEZONE_PLACEHOLDER
+      - N8N_ENCRYPTION_KEY=ENCRYPTION_KEY_PLACEHOLDER
       - DB_TYPE=mysqldb
       - DB_MYSQLDB_HOST=mysql
       - DB_MYSQLDB_PORT=3306
       - DB_MYSQLDB_DATABASE=n8n
-      - DB_MYSQLDB_USER=${MYSQL_USER:-dbuser}
-      - DB_MYSQLDB_PASSWORD=${MYSQL_PASSWORD:-password}
+      - DB_MYSQLDB_USER=MYSQL_USER_PLACEHOLDER
+      - DB_MYSQLDB_PASSWORD=MYSQL_PASS_PLACEHOLDER
     volumes:
-      - ${N8N_VOLUME_DIR}:/home/node/.n8n
+      - n8n_data:/home/node/.n8n
     networks:
       - traefik-network
       - internal
@@ -973,22 +956,8 @@ EOF
         condition: service_healthy
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.n8n.rule=Host(\`${N8N_HOST}\`)"
-EOF
-
-    if [ "$BASE_DOMAIN" != "localhost" ]; then
-        cat >> "$MAIN_COMPOSE_FILE" << EOF
-      - "traefik.http.routers.n8n.entrypoints=websecure"
-      - "traefik.http.routers.n8n.tls=true"
-      - "traefik.http.routers.n8n.tls.certresolver=letsencrypt"
-EOF
-    else
-        cat >> "$MAIN_COMPOSE_FILE" << EOF
+      - "traefik.http.routers.n8n.rule=Host(`N8N_HOST_PLACEHOLDER`)"
       - "traefik.http.routers.n8n.entrypoints=web"
-EOF
-    fi
-
-    cat >> "$MAIN_COMPOSE_FILE" << EOF
       - "traefik.http.services.n8n.loadbalancer.server.port=5678"
       - "traefik.docker.network=traefik-network"
     healthcheck:
@@ -998,44 +967,13 @@ EOF
       retries: 3
       start_period: 40s
 
-  # ============================================
-  # MYSQL - Database Server
-  # ============================================
-  mysql:
-    image: mysql:8.0
-    container_name: mysql
-    restart: unless-stopped
-    environment:
-      - TZ=${SYSTEM_TZ}
-      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-rootpassword}
-      - MYSQL_USER=${MYSQL_USER:-dbuser}
-      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-password}
-      - MYSQL_DATABASE=n8n
-    volumes:
-      - ${MYSQL_DIR}/data:/var/lib/mysql
-      - ${MYSQL_DIR}/init:/docker-entrypoint-initdb.d
-    networks:
-      - internal
-    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p\${MYSQL_ROOT_PASSWORD:-rootpassword}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-
-  # ============================================
-  # PHPMYADMIN - Database Management
-  # ============================================
   phpmyadmin:
     image: phpmyadmin:latest
     container_name: phpmyadmin
     restart: unless-stopped
     environment:
-      - TZ=${SYSTEM_TZ}
       - PMA_HOST=mysql
       - PMA_PORT=3306
-      - PMA_ARBITRARY=1
       - UPLOAD_LIMIT=100M
     networks:
       - traefik-network
@@ -1045,30 +983,29 @@ EOF
         condition: service_healthy
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.phpmyadmin.rule=Host(\`${PMA_HOST}\`)"
-EOF
-
-    if [ "$BASE_DOMAIN" != "localhost" ]; then
-        cat >> "$MAIN_COMPOSE_FILE" << EOF
-      - "traefik.http.routers.phpmyadmin.entrypoints=websecure"
-      - "traefik.http.routers.phpmyadmin.tls=true"
-      - "traefik.http.routers.phpmyadmin.tls.certresolver=letsencrypt"
-      - "traefik.http.routers.phpmyadmin.middlewares=auth@file"
-EOF
-    else
-        cat >> "$MAIN_COMPOSE_FILE" << EOF
+      - "traefik.http.routers.phpmyadmin.rule=Host(`PMA_HOST_PLACEHOLDER`)"
       - "traefik.http.routers.phpmyadmin.entrypoints=web"
-EOF
-    fi
-
-    cat >> "$MAIN_COMPOSE_FILE" << EOF
       - "traefik.http.services.phpmyadmin.loadbalancer.server.port=80"
       - "traefik.docker.network=traefik-network"
 
-EOF
+volumes:
+  mysql_data:
+  n8n_data:
+ENDOFFILE
+
+    # Thay thế các placeholder bằng giá trị thực
+    sed -i "s|TRAEFIK_HOST_PLACEHOLDER|${TRAEFIK_HOST}|g" "$MAIN_COMPOSE_FILE"
+    sed -i "s|N8N_HOST_PLACEHOLDER|${N8N_HOST}|g" "$MAIN_COMPOSE_FILE"
+    sed -i "s|PMA_HOST_PLACEHOLDER|${PMA_HOST}|g" "$MAIN_COMPOSE_FILE"
+    sed -i "s|MYSQL_ROOT_PASS_PLACEHOLDER|${MYSQL_ROOT_PASS_SAFE}|g" "$MAIN_COMPOSE_FILE"
+    sed -i "s|MYSQL_USER_PLACEHOLDER|${MYSQL_USER_SAFE}|g" "$MAIN_COMPOSE_FILE"
+    sed -i "s|MYSQL_PASS_PLACEHOLDER|${MYSQL_PASS_SAFE}|g" "$MAIN_COMPOSE_FILE"
+    sed -i "s|TIMEZONE_PLACEHOLDER|${SYSTEM_TZ}|g" "$MAIN_COMPOSE_FILE"
+    sed -i "s|ENCRYPTION_KEY_PLACEHOLDER|${N8N_ENCRYPTION_KEY}|g" "$MAIN_COMPOSE_FILE"
 
     print_success "Docker Compose file đã được tạo"
 }
+
 
 create_mysql_init() {
     print_section "Tạo MySQL initialization script..."
